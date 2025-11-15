@@ -64,7 +64,12 @@ COSMOS_DATABASE_NAME=ai_agent_db
 COSMOS_CONTAINER_NAME=user_data
 ```
 
-5. **Set up Google OAuth**
+5. **Install Playwright browsers**
+```bash
+playwright install chromium
+```
+
+6. **Set up Google OAuth**
 - Download `credentials.json` from Google Cloud Console
 - Place it in the project root
 - First run will open browser for authentication
@@ -116,6 +121,13 @@ gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:8000 --ti
 | `search_emails` | Search Gmail inbox | `search_emails(query)` |
 | `create_calendar_event` | Add calendar events | Schedule meetings/events |
 | `list_calendar_events` | View upcoming events | Check calendar |
+| `navigate_browser` | Navigate to URL | Browser automation |
+| `take_screenshot` | Capture page screenshot | Visual analysis |
+| `analyze_screenshot` | VLM analysis of screenshot | Understand page content |
+| `click_at` | Click at coordinates | Browser interaction |
+| `type_text` | Type text | Form filling |
+| `press_key` | Press keyboard key | Navigation/submission |
+| `scroll_page` | Scroll up/down | Page navigation |
 | `save_contact_to_cosmos` | Save contacts | Store user contacts |
 | `get_user_history` | Retrieve history | Access past conversations |
 | `store_note` | Save notes | Store user notes |

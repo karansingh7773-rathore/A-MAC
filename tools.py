@@ -11,6 +11,7 @@ import riva.client
 from riva.client.auth import Auth
 import asyncio
 import tempfile
+import wave
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_community.tools.gmail.utils import build_resource_service, get_gmail_credentials
 from langchain_community.tools.gmail.create_draft import GmailCreateDraft
@@ -21,6 +22,11 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 import pickle
+from browser_tools import browser_tools_list
+from browser_agent import execute_browser_task
+# Document processing imports
+from unstructured.partition.auto import partition
+from pathlib import Path
 
 # Load environment variables
 load_dotenv()
@@ -31,7 +37,8 @@ logger = logging.getLogger(__name__)
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
-GOOGLE_TOKEN_PATH = os.getenv("GOOGLE_TOKEN_PATH", "token.pickle")
+# Use unified token file with all scopes
+GOOGLE_TOKEN_PATH = os.getenv("GOOGLE_TOKEN_PATH", "token_full_access.pickle")
 COSMOS_ENDPOINT = os.getenv("COSMOS_ENDPOINT")
 COSMOS_KEY = os.getenv("COSMOS_KEY")
 COSMOS_DATABASE_NAME = os.getenv("COSMOS_DATABASE_NAME", "ai_agent_db")
@@ -116,9 +123,30 @@ except Exception as e:
 # Initialize Gmail and Calendar services
 gmail_service = None
 calendar_service = None
+# Use the same comprehensive scopes as google_tools.py
 SCOPES = [
+    # Gmail
+    'https://www.googleapis.com/auth/gmail.send',
+    'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/gmail.modify',
-    'https://www.googleapis.com/auth/calendar'
+    # Calendar
+    'https://www.googleapis.com/auth/calendar',
+    'https://www.googleapis.com/auth/calendar.events',
+    # Contacts & People API
+    'https://www.googleapis.com/auth/contacts',
+    'https://www.googleapis.com/auth/contacts.readonly',
+    # Docs
+    'https://www.googleapis.com/auth/documents',
+    'https://www.googleapis.com/auth/documents.readonly',
+    # Sheets
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/spreadsheets.readonly',
+    # Drive
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/drive.file',
+    'https://www.googleapis.com/auth/drive.readonly',
+    # YouTube Data API
+    'https://www.googleapis.com/auth/youtube.readonly',
 ]
 
 try:
@@ -241,21 +269,27 @@ async def convert_text_to_speech(text_to_speak: str) -> str:
         loop = asyncio.get_event_loop()
         
         def synthesize_sync():
-            # synthesize() returns a single response object, not iterable
+            # synthesize() returns a single response object with raw audio data
             response = riva_tts_service.synthesize(
                 text=text_to_speak,
-                voice_name="Magpie-Multilingual.EN-US.Aria",
+                voice_name="Magpie-Multilingual.EN-US.Mia",
                 language_code="en-US",
                 sample_rate_hz=22050
             )
             
-            # Write the audio data directly
-            with open(local_file_path, "wb") as f:
-                f.write(response.audio)
+            # Write the raw audio data as a proper WAV file with header
+            with wave.open(local_file_path, 'wb') as wav_file:
+                # Set WAV file parameters
+                wav_file.setnchannels(1)  # Mono audio
+                wav_file.setsampwidth(2)  # 16-bit = 2 bytes
+                wav_file.setframerate(22050)  # Sample rate
+                
+                # Write the raw audio data
+                wav_file.writeframes(response.audio)
         
         await loop.run_in_executor(None, synthesize_sync)
         
-        logger.info(f"TTS audio saved locally: {local_file_path}")
+        logger.info(f"TTS audio saved locally with proper WAV header: {local_file_path}")
         
         # Verify file was created
         if not os.path.exists(local_file_path):
@@ -270,15 +304,15 @@ async def convert_text_to_speech(text_to_speak: str) -> str:
 
 
 @tool
-def save_contact_to_cosmos(name: str, email: Optional[str] = None, phone: Optional[str] = None, user_id: str = "default") -> str:
+def save_user_preference(user_id: str, preference_key: str, preference_value: str) -> str:
     """
-    Save a contact to Azure Cosmos DB.
+    Save a user preference to Cosmos DB.
+    Use this for storing user-specific settings like timezone, language, notification preferences, etc.
     
     Args:
-        name: Contact's full name
-        email: Contact's email address (optional)
-        phone: Contact's phone number (optional)
-        user_id: The ID of the user saving this contact
+        user_id: The ID of the user
+        preference_key: The preference name (e.g., "timezone", "language", "theme")
+        preference_value: The preference value
         
     Returns:
         Success or error message
@@ -287,49 +321,44 @@ def save_contact_to_cosmos(name: str, email: Optional[str] = None, phone: Option
         if not container:
             return "Error: Cosmos DB not initialized"
         
-        contact_id = str(uuid.uuid4())
-        contact_item = {
-            "id": contact_id,
+        pref_id = f"{user_id}_{preference_key}"
+        pref_item = {
+            "id": pref_id,
             "user_id": user_id,
-            "type": "contact",
-            "name": name,
-            "email": email,
-            "phone": phone,
-            "created_at": datetime.utcnow().isoformat(),
+            "type": "preference",
+            "key": preference_key,
+            "value": preference_value,
             "updated_at": datetime.utcnow().isoformat()
         }
         
-        container.create_item(body=contact_item)
-        logger.info(f"Contact saved: {name} for user {user_id}")
+        # Upsert (update or insert)
+        container.upsert_item(body=pref_item)
+        logger.info(f"Preference saved: {preference_key}={preference_value} for user {user_id}")
         
-        return "OK. Contact saved."
+        return f"✅ Preference saved: {preference_key} = {preference_value}"
     
     except exceptions.CosmosHttpResponseError as e:
-        logger.error(f"Failed to save contact: {e}")
-        return f"Error saving contact: {str(e)}"
+        logger.error(f"Failed to save preference: {e}")
+        return f"Error saving preference: {str(e)}"
 
 
 @tool
-def get_user_history(user_id: str, limit: int = 10) -> str:
+def get_user_preferences(user_id: str) -> str:
     """
-    Retrieve conversation history and notes for a user from Cosmos DB.
+    Retrieve all user preferences from Cosmos DB.
     
     Args:
         user_id: The ID of the user
-        limit: Maximum number of items to retrieve
         
     Returns:
-        JSON string of user history
+        Dictionary of user preferences
     """
     try:
         if not container:
             return "Error: Cosmos DB not initialized"
         
-        query = f"SELECT * FROM c WHERE c.user_id = @user_id ORDER BY c.created_at DESC OFFSET 0 LIMIT @limit"
-        parameters = [
-            {"name": "@user_id", "value": user_id},
-            {"name": "@limit", "value": limit}
-        ]
+        query = f"SELECT * FROM c WHERE c.user_id = @user_id AND c.type = 'preference'"
+        parameters = [{"name": "@user_id", "value": user_id}]
         
         items = list(container.query_items(
             query=query,
@@ -337,22 +366,90 @@ def get_user_history(user_id: str, limit: int = 10) -> str:
             enable_cross_partition_query=True
         ))
         
-        logger.info(f"Retrieved {len(items)} history items for user {user_id}")
-        
         if not items:
-            return f"No history found for user {user_id}"
+            return f"No preferences found for user {user_id}"
         
-        return str(items)
+        prefs = {item['key']: item['value'] for item in items}
+        
+        formatted = "\n".join([f"• {k}: {v}" for k, v in prefs.items()])
+        return f"*Your Preferences:*\n{formatted}"
     
     except exceptions.CosmosHttpResponseError as e:
-        logger.error(f"Failed to retrieve user history: {e}")
-        return f"Error retrieving history: {str(e)}"
+        logger.error(f"Failed to retrieve preferences: {e}")
+        return f"Error retrieving preferences: {str(e)}"
+
+
+@tool
+def save_agent_state(user_id: str, task_name: str, state_data: str) -> str:
+    """
+    Save agent state for multi-day tasks (like Techathon projects).
+    Use this to remember task progress, intermediate results, and continue work later.
+    
+    Args:
+        user_id: The ID of the user
+        task_name: Name of the task/project (e.g., "Techathon_ML_Project")
+        state_data: JSON string or text describing the current state
+        
+    Returns:
+        Success or error message
+    """
+    try:
+        if not container:
+            return "Error: Cosmos DB not initialized"
+        
+        state_id = f"{user_id}_{task_name}"
+        state_item = {
+            "id": state_id,
+            "user_id": user_id,
+            "type": "agent_state",
+            "task_name": task_name,
+            "state": state_data,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        container.upsert_item(body=state_item)
+        logger.info(f"Agent state saved for task: {task_name} (user {user_id})")
+        
+        return f"✅ Task state saved: {task_name}"
+    
+    except exceptions.CosmosHttpResponseError as e:
+        logger.error(f"Failed to save agent state: {e}")
+        return f"Error saving task state: {str(e)}"
+
+
+@tool
+def get_agent_state(user_id: str, task_name: str) -> str:
+    """
+    Retrieve agent state for a specific task.
+    
+    Args:
+        user_id: The ID of the user
+        task_name: Name of the task/project
+        
+    Returns:
+        Task state data or error message
+    """
+    try:
+        if not container:
+            return "Error: Cosmos DB not initialized"
+        
+        state_id = f"{user_id}_{task_name}"
+        
+        try:
+            item = container.read_item(item=state_id, partition_key=user_id)
+            return f"*Task: {task_name}*\n\nLast updated: {item['updated_at']}\n\nState:\n{item['state']}"
+        except exceptions.CosmosResourceNotFoundError:
+            return f"No saved state found for task: {task_name}"
+    
+    except exceptions.CosmosHttpResponseError as e:
+        logger.error(f"Failed to retrieve agent state: {e}")
+        return f"Error retrieving task state: {str(e)}"
 
 
 @tool
 def store_note(user_id: str, note_content: str) -> str:
     """
-    Store a note for a user in Cosmos DB.
+    Store a quick note for the user in Cosmos DB.
     
     Args:
         user_id: The ID of the user
@@ -371,18 +468,60 @@ def store_note(user_id: str, note_content: str) -> str:
             "user_id": user_id,
             "type": "note",
             "content": note_content,
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat()
+            "created_at": datetime.utcnow().isoformat()
         }
         
         container.create_item(body=note_item)
         logger.info(f"Note stored for user {user_id}")
         
-        return f"Successfully stored note"
+        return f"✅ Note saved successfully"
     
     except exceptions.CosmosHttpResponseError as e:
         logger.error(f"Failed to store note: {e}")
         return f"Error storing note: {str(e)}"
+
+
+@tool
+def get_notes(user_id: str, limit: int = 10) -> str:
+    """
+    Retrieve recent notes for a user.
+    
+    Args:
+        user_id: The ID of the user
+        limit: Maximum number of notes to retrieve
+        
+    Returns:
+        List of notes
+    """
+    try:
+        if not container:
+            return "Error: Cosmos DB not initialized"
+        
+        query = f"SELECT * FROM c WHERE c.user_id = @user_id AND c.type = 'note' ORDER BY c.created_at DESC OFFSET 0 LIMIT @limit"
+        parameters = [
+            {"name": "@user_id", "value": user_id},
+            {"name": "@limit", "value": limit}
+        ]
+        
+        items = list(container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+        
+        if not items:
+            return f"No notes found for user {user_id}"
+        
+        notes_list = []
+        for idx, note in enumerate(items, 1):
+            created = note['created_at'][:10]  # Just the date
+            notes_list.append(f"{idx}. ({created}) {note['content']}")
+        
+        return f"*📝 Your Notes ({len(items)}):*\n\n" + "\n\n".join(notes_list)
+    
+    except exceptions.CosmosHttpResponseError as e:
+        logger.error(f"Failed to retrieve notes: {e}")
+        return f"Error retrieving notes: {str(e)}"
 
 
 @tool
@@ -431,7 +570,7 @@ async def web_search(query: str) -> str:
 @tool
 async def send_email(to: str, subject: str, body: str) -> str:
     """
-    Send an email using Gmail.
+    Send an email using Gmail with HTML formatting.
     
     Args:
         to: Recipient email address
@@ -447,12 +586,68 @@ async def send_email(to: str, subject: str, body: str) -> str:
         
         logger.info(f"Sending email to: {to}")
         
+        from email.mime.multipart import MIMEMultipart
         from email.mime.text import MIMEText
         import base64
         
-        message = MIMEText(body)
+        # Convert plain text to HTML with proper formatting
+        # Replace \n\n with paragraph breaks and \n with line breaks
+        html_body = body.replace('\n\n', '</p><p>').replace('\n', '<br>')
+        
+        # Detect headings (lines that end with : or are in title case)
+        lines = body.split('\n')
+        formatted_lines = []
+        for line in lines:
+            stripped = line.strip()
+            # Check if line looks like a heading (ends with : or is short and capitalized)
+            if stripped and (
+                stripped.endswith(':') or 
+                (len(stripped.split()) <= 8 and stripped[0].isupper() and not stripped.endswith('.'))
+            ):
+                formatted_lines.append(f'<h3 style="margin-top: 20px; margin-bottom: 10px; color: #333;">{stripped}</h3>')
+            elif stripped:
+                formatted_lines.append(f'<p style="margin-bottom: 12px; line-height: 1.6;">{stripped}</p>')
+            else:
+                formatted_lines.append('<br>')
+        
+        html_content = f"""
+        <html>
+            <head>
+                <style>
+                    body {{
+                        font-family: Arial, Helvetica, sans-serif;
+                        font-size: 14px;
+                        color: #333;
+                        line-height: 1.6;
+                    }}
+                    p {{
+                        margin-bottom: 12px;
+                    }}
+                    h3 {{
+                        margin-top: 20px;
+                        margin-bottom: 10px;
+                        color: #333;
+                    }}
+                </style>
+            </head>
+            <body>
+                {''.join(formatted_lines)}
+            </body>
+        </html>
+        """
+        
+        # Create message with both HTML and plain text versions
+        message = MIMEMultipart('alternative')
         message['to'] = to
         message['subject'] = subject
+        
+        # Plain text version (fallback)
+        text_part = MIMEText(body, 'plain')
+        message.attach(text_part)
+        
+        # HTML version (preferred)
+        html_part = MIMEText(html_content, 'html')
+        message.attach(html_part)
         
         raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
         
@@ -466,7 +661,7 @@ async def send_email(to: str, subject: str, body: str) -> str:
         )
         
         logger.info(f"Email sent successfully. Message ID: {result['id']}")
-        return "OK. Email sent."
+        return "Email sent successfully."
     
     except Exception as e:
         logger.error(f"Failed to send email: {e}")
@@ -644,16 +839,176 @@ async def list_calendar_events(max_results: int = 10) -> str:
         return f"Error listing calendar events: {str(e)}"
 
 
-# Export all tools as a list for the agent
+@tool
+async def read_document(file_path: str) -> str:
+    """
+    Read and extract text from any document file (PDF, DOCX, PPTX, TXT, images, etc.).
+    
+    This tool uses the Unstructured library to intelligently parse documents:
+    - Auto-detects file type (.pdf, .docx, .pptx, .txt, .html, images, etc.)
+    - Extracts text from digital PDFs
+    - Performs OCR on scanned PDFs and images (using Tesseract)
+    - Identifies document structure (titles, headings, paragraphs, lists, tables)
+    - Removes junk like headers, footers, and page numbers
+    
+    Args:
+        file_path: Absolute path to the file to read (e.g., "C:/Documents/report.pdf")
+        
+    Returns:
+        Extracted and cleaned text content from the document
+        
+    Examples:
+        - read_document("C:/Users/John/Desktop/contract.pdf")
+        - read_document("D:/Downloads/presentation.pptx")
+        - read_document("E:/Work/invoice_scan.jpg")
+    """
+    try:
+        # Validate file exists
+        file_path_obj = Path(file_path)
+        if not file_path_obj.exists():
+            return f"Error: File not found at path: {file_path}"
+        
+        if not file_path_obj.is_file():
+            return f"Error: Path is not a file: {file_path}"
+        
+        logger.info(f"Processing document: {file_path}")
+        
+        # Use Unstructured to partition the document
+        # This automatically detects file type and extracts content
+        elements = partition(filename=str(file_path))
+        
+        if not elements:
+            return f"Error: No content could be extracted from {file_path}"
+        
+        # Organize content by element type
+        structured_content = {
+            'titles': [],
+            'headings': [],
+            'text': [],
+            'lists': [],
+            'tables': [],
+            'other': []
+        }
+        
+        for element in elements:
+            element_type = str(type(element).__name__)
+            element_text = str(element).strip()
+            
+            if not element_text:
+                continue
+            
+            # Categorize elements
+            if 'Title' in element_type:
+                structured_content['titles'].append(element_text)
+            elif 'Header' in element_type or 'Heading' in element_type:
+                structured_content['headings'].append(element_text)
+            elif 'NarrativeText' in element_type or 'Text' in element_type:
+                structured_content['text'].append(element_text)
+            elif 'ListItem' in element_type:
+                structured_content['lists'].append(element_text)
+            elif 'Table' in element_type:
+                structured_content['tables'].append(element_text)
+            else:
+                structured_content['other'].append(element_text)
+        
+        # Format the output nicely
+        output_parts = []
+        
+        # Add file info
+        file_size = file_path_obj.stat().st_size / 1024  # KB
+        output_parts.append(f"📄 Document: {file_path_obj.name}")
+        output_parts.append(f"📊 Size: {file_size:.2f} KB")
+        output_parts.append(f"📝 Elements found: {len(elements)}")
+        output_parts.append("\n" + "="*60 + "\n")
+        
+        # Add titles
+        if structured_content['titles']:
+            output_parts.append("📌 TITLES:")
+            for title in structured_content['titles']:
+                output_parts.append(f"  • {title}")
+            output_parts.append("")
+        
+        # Add headings
+        if structured_content['headings']:
+            output_parts.append("📑 HEADINGS:")
+            for heading in structured_content['headings']:
+                output_parts.append(f"  • {heading}")
+            output_parts.append("")
+        
+        # Add main text content
+        if structured_content['text']:
+            output_parts.append("📖 CONTENT:")
+            output_parts.append("\n".join(structured_content['text']))
+            output_parts.append("")
+        
+        # Add lists
+        if structured_content['lists']:
+            output_parts.append("📋 LISTS:")
+            for item in structured_content['lists']:
+                output_parts.append(f"  • {item}")
+            output_parts.append("")
+        
+        # Add tables
+        if structured_content['tables']:
+            output_parts.append("📊 TABLES:")
+            for table in structured_content['tables']:
+                output_parts.append(table)
+                output_parts.append("---")
+            output_parts.append("")
+        
+        # Add other content
+        if structured_content['other']:
+            output_parts.append("📎 OTHER ELEMENTS:")
+            output_parts.append("\n".join(structured_content['other']))
+        
+        result = "\n".join(output_parts)
+        
+        logger.info(f"Successfully extracted {len(elements)} elements from {file_path_obj.name}")
+        
+        return result
+    
+    except Exception as e:
+        logger.error(f"Failed to read document {file_path}: {e}", exc_info=True)
+        return f"Error reading document: {str(e)}\n\nMake sure the file path is correct and the file is accessible."
+
+
+@tool
+async def browser_automation(task_description: str) -> str:
+    """
+    Execute browser automation tasks using DeepSeek AI with vision.
+    Use this for tasks on websites like YouTube, WhatsApp Web, Instagram, etc.
+    
+    Args:
+        task_description: What to do (e.g., "Search for 'timeless song' on YouTube and play the first video")
+        
+    Returns:
+        Result of the browser task
+    """
+    try:
+        result = await execute_browser_task(task_description)
+        return result
+    except Exception as e:
+        logger.error(f"Browser automation failed: {e}")
+        return f"Error: {str(e)}"
+
+
+# Export all tools
 tools_list = [
     transcribe_audio,
     convert_text_to_speech,
     web_search,
+    read_document,  # Document processing tool (PDF, DOCX, PPTX, images, etc.)
+    browser_automation,  # Single browser automation tool
     send_email,
     search_emails,
     create_calendar_event,
     list_calendar_events,
-    save_contact_to_cosmos,
-    get_user_history,
-    store_note
+    # Cosmos DB - User Preferences & Agent State
+    save_user_preference,
+    get_user_preferences,
+    save_agent_state,
+    get_agent_state,
+    store_note,
+    get_notes,
 ]
+

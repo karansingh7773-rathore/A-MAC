@@ -32,6 +32,7 @@ venv.bak/
 # Environment Variables
 .env
 *.env
+*.pyc
 
 # IDE
 .vscode/
@@ -44,6 +45,8 @@ venv.bak/
 *.log
 
 # Google OAuth
+*.pickle
+token_full_access.pickle
 token.pickle
 credentials.json
 
@@ -64,3 +67,8 @@ Thumbs.db
 *.tmp
 tmp/
 temp/
+
+# Browser automation
+browser_data/
+screenshot_*.png
+*.exe
